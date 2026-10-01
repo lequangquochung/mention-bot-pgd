@@ -1,92 +1,170 @@
-const Database = require('better-sqlite3');
+// ============================================
+// Supabase Database Adapter
+// Production-only implementation
+// ============================================
 
-const db = new Database('members.sqlite');
+const { createClient } = require('@supabase/supabase-js');
 
-db.pragma('journal_mode = WAL');
+// Initialize Supabase client (singleton pattern)
+let supabaseClient = null;
 
-db.exec(`
-CREATE TABLE IF NOT EXISTS members (
-  chat_id INTEGER NOT NULL,
-  user_id INTEGER NOT NULL,
-  username TEXT,
-  full_name TEXT NOT NULL,
-  is_opted_out INTEGER NOT NULL DEFAULT 0,
-  updated_at INTEGER NOT NULL,
-  PRIMARY KEY (chat_id, user_id)
-);
+function getSupabaseClient() {
+  if (supabaseClient) {
+    return supabaseClient;
+  }
 
-CREATE TABLE IF NOT EXISTS cooldowns (
-  chat_id INTEGER NOT NULL,
-  command TEXT NOT NULL,
-  next_available_at INTEGER NOT NULL,
-  PRIMARY KEY (chat_id, command)
-);
-`);
+  const supabaseUrl = process.env.SUPABASE_URL;
+  const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
 
-function upsertMember({ chatId, userId, username, fullName }) {
-  const stmt = db.prepare(`
-    INSERT INTO members (chat_id, user_id, username, full_name, updated_at)
-    VALUES (@chatId, @userId, @username, @fullName, @updatedAt)
-    ON CONFLICT(chat_id, user_id)
-    DO UPDATE SET
-      username = excluded.username,
-      full_name = excluded.full_name,
-      updated_at = excluded.updated_at
-  `);
+  if (!supabaseUrl || !supabaseKey) {
+    throw new Error(
+      'Missing required environment variables: SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY'
+    );
+  }
 
-  stmt.run({
-    chatId,
-    userId,
+  supabaseClient = createClient(supabaseUrl, supabaseKey, {
+    auth: { persistSession: false },
+  });
+
+  return supabaseClient;
+}
+
+// ============================================
+// Members Operations
+// ============================================
+
+async function upsertMember({ chatId, userId, username, fullName }) {
+  const supabase = getSupabaseClient();
+
+  const memberData = {
+    chat_id: chatId,
+    user_id: userId,
     username: username || null,
-    fullName,
-    updatedAt: Date.now()
-  });
+    full_name: fullName || null,
+    enabled: true,
+    updated_at: new Date().toISOString(),
+  };
+
+  const { error } = await supabase
+    .from('members')
+    .upsert(memberData, { onConflict: 'chat_id,user_id' });
+
+  if (error) {
+    throw new Error(`Failed to upsert member: ${error.message}`);
+  }
 }
 
-function setOptOut({ chatId, userId, isOptedOut }) {
-  db.prepare(`
-    UPDATE members
-    SET is_opted_out = @isOptedOut, updated_at = @updatedAt
-    WHERE chat_id = @chatId AND user_id = @userId
-  `).run({
-    chatId,
-    userId,
-    isOptedOut: isOptedOut ? 1 : 0,
-    updatedAt: Date.now()
-  });
+async function setOptOut({ chatId, userId, isOptedOut }) {
+  const supabase = getSupabaseClient();
+
+  const memberData = {
+    chat_id: chatId,
+    user_id: userId,
+    enabled: !isOptedOut,
+    updated_at: new Date().toISOString(),
+  };
+
+  const { error } = await supabase
+    .from('members')
+    .upsert(memberData, { onConflict: 'chat_id,user_id' });
+
+  if (error) {
+    throw new Error(`Failed to update opt-out status: ${error.message}`);
+  }
 }
 
-function getTaggableMembers(chatId) {
-  return db
-    .prepare(`
-      SELECT user_id, username, full_name
-      FROM members
-      WHERE chat_id = ? AND is_opted_out = 0
-      ORDER BY updated_at DESC
-    `)
-    .all(chatId);
+async function getTaggableMembers(chatId, limit = 10000) {
+  const supabase = getSupabaseClient();
+
+  const { data, error } = await supabase
+    .from('members')
+    .select('user_id,username,full_name')
+    .eq('chat_id', chatId)
+    .eq('enabled', true)
+    .order('updated_at', { ascending: false })
+    .limit(limit);
+
+  if (error) {
+    throw new Error(`Failed to fetch taggable members: ${error.message}`);
+  }
+
+  return (data || []).map((row) => ({
+    user_id: row.user_id,
+    username: row.username,
+    full_name: row.full_name,
+  }));
 }
 
-function getCooldown(chatId, command) {
-  const row = db
-    .prepare(`SELECT next_available_at FROM cooldowns WHERE chat_id = ? AND command = ?`)
-    .get(chatId, command);
-  return row ? row.next_available_at : 0;
+// ============================================
+// Cooldown Operations
+// ============================================
+
+async function getCooldown(chatId, command = 'all') {
+  const supabase = getSupabaseClient();
+
+  let result;
+  try {
+    // Try to use maybeSingle if available (newer versions)
+    if (typeof supabase.from('').maybeSingle === 'function') {
+      result = await supabase
+        .from('cooldowns')
+        .select('next_available_at')
+        .eq('chat_id', chatId)
+        .eq('command', command)
+        .maybeSingle();
+    } else {
+      // Fallback for older versions
+      result = await supabase
+        .from('cooldowns')
+        .select('next_available_at')
+        .eq('chat_id', chatId)
+        .eq('command', command)
+        .limit(1)
+        .single()
+        .catch(() => ({ data: null, error: null }));
+    }
+  } catch (err) {
+    // No cooldown found
+    return 0;
+  }
+
+  if (result.error || !result.data || !result.data.next_available_at) {
+    return 0;
+  }
+
+  return new Date(result.data.next_available_at).getTime();
 }
 
-function setCooldown(chatId, command, nextAvailableAt) {
-  db.prepare(`
-    INSERT INTO cooldowns (chat_id, command, next_available_at)
-    VALUES (?, ?, ?)
-    ON CONFLICT(chat_id, command)
-    DO UPDATE SET next_available_at = excluded.next_available_at
-  `).run(chatId, command, nextAvailableAt);
+async function setCooldown(
+  chatId,
+  command = 'all',
+  nextAvailableAt = new Date()
+) {
+  const supabase = getSupabaseClient();
+
+  const cooldownData = {
+    chat_id: chatId,
+    command,
+    next_available_at: new Date(nextAvailableAt).toISOString(),
+  };
+
+  const { error } = await supabase
+    .from('cooldowns')
+    .upsert(cooldownData, { onConflict: 'chat_id,command' });
+
+  if (error) {
+    throw new Error(`Failed to set cooldown: ${error.message}`);
+  }
 }
+
+// ============================================
+// Exports
+// ============================================
 
 module.exports = {
   upsertMember,
   setOptOut,
   getTaggableMembers,
   getCooldown,
-  setCooldown
+  setCooldown,
 };
