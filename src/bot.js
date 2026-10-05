@@ -133,7 +133,7 @@ bot.command('all', async (ctx) => {
     return;
   }
 
-  const members = (await getTaggableMembers(ctx.chat.id)).filter((m) => m.user_id !== ctx.botInfo.id);
+  const members = (await getTaggableMembers(ctx.chat.id)).filter((m) => m.user_id !== ctx.botInfo.id && m.user_id !== ctx.from.id);
   if (members.length === 0) {
     await ctx.reply('Chưa có member nào trong danh sách. Mọi người hãy nhắn 1 tin để bot ghi nhận.');
     return;
